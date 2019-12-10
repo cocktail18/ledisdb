@@ -141,12 +141,12 @@ func (db *DB) zEncodeStopSetKey(key []byte) []byte {
 	return k
 }
 
-func (db *DB) zEncodeScoreKey(key []byte, member []byte, score int64) []byte {
+func (db *DB) zEncodeScoreKeyInternal(key []byte, member []byte, score int64, zScoreType byte) []byte {
 	buf := make([]byte, len(key)+len(member)+13+len(db.indexVarBuf))
 
 	pos := copy(buf, db.indexVarBuf)
 
-	buf[pos] = ZScoreType
+	buf[pos] = zScoreType
 	pos++
 
 	binary.BigEndian.PutUint16(buf[pos:], uint16(len(key)))
@@ -172,12 +172,39 @@ func (db *DB) zEncodeScoreKey(key []byte, member []byte, score int64) []byte {
 	return buf
 }
 
+func (db *DB) zEncodeScoreKey(key []byte, member []byte, score int64) []byte {
+	return db.zEncodeScoreKeyInternal(key, member, score, ZScoreType)
+}
+
+func (db *DB) zEncodeRevScoreKey(key []byte, member []byte, score int64) []byte {
+	if score <= MinScore {
+		score = MaxScore
+	} else if score == MaxScore {
+		score = MinScore
+	} else {
+		score = score * -1
+	}
+	return db.zEncodeScoreKeyInternal(key, member, score, ZRevScoreType)
+}
+
 func (db *DB) zEncodeStartScoreKey(key []byte, score int64) []byte {
 	return db.zEncodeScoreKey(key, nil, score)
 }
 
+// score is minScore
+func (db *DB) zEncodeRevStartScoreKey(key []byte, score int64) []byte {
+	k := db.zEncodeRevScoreKey(key, nil, score)
+	return k
+}
+
 func (db *DB) zEncodeStopScoreKey(key []byte, score int64) []byte {
 	k := db.zEncodeScoreKey(key, nil, score)
+	k[len(k)-1] = zsetStopMemSep
+	return k
+}
+
+func (db *DB) zEncodeRevStopScoreKey(key []byte, score int64) []byte {
+	k := db.zEncodeRevScoreKey(key, nil, score)
 	k[len(k)-1] = zsetStopMemSep
 	return k
 }
@@ -188,8 +215,11 @@ func (db *DB) zDecodeScoreKey(ek []byte) (key []byte, member []byte, score int64
 	if err != nil {
 		return
 	}
-
-	if pos+1 > len(ek) || ek[pos] != ZScoreType {
+	isZRevScoreType := false
+	if ek[pos] == ZRevScoreType {
+		isZRevScoreType = true
+	}
+	if pos+1 > len(ek) || (ek[pos] != ZScoreType && ek[pos] != ZRevScoreType) {
 		err = errZScoreKey
 		return
 	}
@@ -222,6 +252,15 @@ func (db *DB) zDecodeScoreKey(ek []byte) (key []byte, member []byte, score int64
 	pos++
 
 	score = int64(binary.BigEndian.Uint64(ek[pos:]))
+	if isZRevScoreType {
+		if score <= MinScore {
+			score = MaxScore
+		} else if score == MaxScore {
+			score = MinScore
+		} else {
+			score = score * -1
+		}
+	}
 	pos += 8
 
 	if ek[pos] != zsetStartMemSep {
@@ -255,13 +294,17 @@ func (db *DB) zSetItem(t *batch, key []byte, score int64, member []byte) (int64,
 
 		sk := db.zEncodeScoreKey(key, member, s)
 		t.Delete(sk)
+
+		skRev := db.zEncodeRevScoreKey(key, member, s)
+		t.Delete(skRev)
 	}
 
 	t.Put(ek, PutInt64(score))
 
 	sk := db.zEncodeScoreKey(key, member, score)
 	t.Put(sk, []byte{})
-
+	sk2 := db.zEncodeRevScoreKey(key, member, score)
+	t.Put(sk2, []byte{})
 	return exists, nil
 }
 
@@ -282,6 +325,8 @@ func (db *DB) zDelItem(t *batch, key []byte, member []byte, skipDelScore bool) (
 			}
 			sk := db.zEncodeScoreKey(key, member, s)
 			t.Delete(sk)
+			sk2 := db.zEncodeRevScoreKey(key, member, s)
+			t.Delete(sk2)
 		}
 	}
 
@@ -460,13 +505,18 @@ func (db *DB) ZIncrBy(key []byte, delta int64, member []byte) (int64, error) {
 	}
 
 	sk := db.zEncodeScoreKey(key, member, newScore)
+	sk2 := db.zEncodeRevScoreKey(key, member, newScore)
 	t.Put(sk, []byte{})
+	t.Put(sk2, []byte{})
 	t.Put(ek, PutInt64(newScore))
 
 	if v != nil {
 		// so as to update score, we must delete the old one
 		oldSk := db.zEncodeScoreKey(key, member, oldScore)
 		t.Delete(oldSk)
+		// so as to update score, we must delete the old one
+		oldSk2 := db.zEncodeRevScoreKey(key, member, oldScore)
+		t.Delete(oldSk2)
 	}
 
 	err = t.Commit()
@@ -514,15 +564,14 @@ func (db *DB) zrank(key []byte, member []byte, reverse bool) (int64, error) {
 	}
 	var rit *store.RangeLimitIterator
 
-	sk := db.zEncodeScoreKey(key, member, s)
-
 	if !reverse {
+		sk := db.zEncodeScoreKey(key, member, s)
 		minKey := db.zEncodeStartScoreKey(key, MinScore)
-
 		rit = store.NewRangeIterator(it, &store.Range{Min: minKey, Max: sk, Type: store.RangeClose})
 	} else {
-		maxKey := db.zEncodeStopScoreKey(key, MaxScore)
-		rit = store.NewRevRangeIterator(it, &store.Range{Min: sk, Max: maxKey, Type: store.RangeClose})
+		minKey := db.zEncodeRevStartScoreKey(key, MaxScore)
+		sk := db.zEncodeRevScoreKey(key, member, s)
+		rit = store.NewRangeIterator(it, &store.Range{Min: minKey, Max: sk, Type: store.RangeClose})
 	}
 
 	var lastKey []byte
@@ -543,13 +592,14 @@ func (db *DB) zrank(key []byte, member []byte, reverse bool) (int64, error) {
 }
 
 func (db *DB) zIterator(key []byte, min int64, max int64, offset int, count int, reverse bool) *store.RangeLimitIterator {
-	minKey := db.zEncodeStartScoreKey(key, min)
-	maxKey := db.zEncodeStopScoreKey(key, max)
-
 	if !reverse {
+		minKey := db.zEncodeStartScoreKey(key, min)
+		maxKey := db.zEncodeStopScoreKey(key, max)
 		return db.bucket.RangeLimitIterator(minKey, maxKey, store.RangeClose, offset, count)
 	}
-	return db.bucket.RevRangeLimitIterator(minKey, maxKey, store.RangeClose, offset, count)
+	minKey := db.zEncodeRevStartScoreKey(key, max)
+	maxKey := db.zEncodeRevStopScoreKey(key, min)
+	return db.bucket.RangeLimitIterator(minKey, maxKey, store.RangeClose, offset, count)
 }
 
 func (db *DB) zRemRange(t *batch, key []byte, min int64, max int64, offset int, count int) (int64, error) {
@@ -604,7 +654,7 @@ func (db *DB) zRange(key []byte, min int64, max int64, offset int, count int, re
 
 	//if reverse and offset is 0, count < 0, we may use forward iterator then reverse
 	//because store iterator prev is slower than next
-	if !reverse || (offset == 0 && count < 0) {
+	if !reverse {
 		it = db.zIterator(key, min, max, offset, count, false)
 	} else {
 		it = db.zIterator(key, min, max, offset, count, true)
@@ -620,12 +670,6 @@ func (db *DB) zRange(key []byte, min int64, max int64, offset int, count int, re
 		v = append(v, ScorePair{Member: m, Score: s})
 	}
 	it.Close()
-
-	if reverse && (offset == 0 && count < 0) {
-		for i, j := 0, len(v)-1; i < j; i, j = i+1, j-1 {
-			v[i], v[j] = v[j], v[i]
-		}
-	}
 
 	return v, nil
 }

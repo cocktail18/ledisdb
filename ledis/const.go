@@ -47,15 +47,16 @@ const (
 
 // for backend store
 const (
-	NoneType   byte = 0
-	KVType     byte = 1
-	HashType   byte = 2
-	HSizeType  byte = 3
-	ListType   byte = 4
-	LMetaType  byte = 5
-	ZSetType   byte = 6
-	ZSizeType  byte = 7
-	ZScoreType byte = 8
+	NoneType      byte = 0
+	KVType        byte = 1
+	HashType      byte = 2
+	HSizeType     byte = 3
+	ListType      byte = 4
+	LMetaType     byte = 5
+	ZSetType      byte = 6
+	ZSizeType     byte = 7
+	ZScoreType    byte = 8
+	ZRevScoreType byte = 13
 	// BitType     byte = 9
 	// BitMetaType byte = 10
 	SetType   byte = 11
